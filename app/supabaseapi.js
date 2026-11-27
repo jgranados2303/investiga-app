@@ -1,50 +1,42 @@
 'use strict';
 /* InvestigaApp · Capa 2 en la nube (Supabase).
-   Mantiene las mismas rutas que usaba la app (register, login, state, projects/{id}/…)
-   y delega las reglas en funciones del servidor con seguridad por fila (RLS). */
+   Ofrece las mismas rutas que backend/server.py y web/localapi.js (register, login, state, projects/{id}/…)
+   sobre Supabase. Las reglas (rúbrica v2, Mentor v2, permisos, panel docente) se aplican en el servidor,
+   en funciones SQL con seguridad por fila: supabase/migrations/*_06_rubrica_mentor_v2_gestion.sql.
+   Requiere, antes que este archivo: supabase.min.js, config.js y documentos.js. */
 (function(){
 const cfg=window.INVESTIGA_CONFIG;
+/* El enlace de recuperación llega con #…type=recovery; se lee antes de que el cliente limpie la URL. */
+const RECOVERY_LINK=/(^|[#&?])type=recovery(&|$)/.test(location.hash+'&'+location.search.slice(1));
 const sb=window.supabase.createClient(cfg.supabaseUrl,cfg.supabaseKey,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true,storageKey:'investigaapp-auth'}});
+const api={recovery:RECOVERY_LINK};
+sb.auth.onAuthStateChange(ev=>{if(ev==='PASSWORD_RECOVERY')api.recovery=true});
 const STYLES=['APA','IEEE','Vancouver'];
+const here=()=>location.origin+location.pathname;
 
 function fail(m){throw new Error(m)}
 function clean(msg){
   msg=String(msg||'No se pudo realizar la operación');
   if(/Invalid login credentials/i.test(msg))return 'Credenciales incorrectas.';
-  if(/Email not confirmed/i.test(msg))return 'Tu correo aún no está confirmado. Revisa tu bandeja de entrada (y la carpeta de spam).';
+  if(/Email not confirmed/i.test(msg))return 'Tu correo aún no está confirmado. Abre el enlace que te enviamos (revisa también la carpeta de spam).';
   if(/User already registered/i.test(msg))return 'El correo ya está registrado. Ingresa con tu contraseña.';
-  if(/rate limit/i.test(msg))return 'Demasiados intentos seguidos. Espera unos minutos y vuelve a intentarlo.';
+  if(/should be different from the old password/i.test(msg))return 'La nueva contraseña debe ser distinta de la actual.';
+  if(/Password should be at least/i.test(msg))return 'La contraseña debe tener al menos 10 caracteres.';
+  if(/rate limit|too many requests|security purposes/i.test(msg))return 'Demasiados intentos seguidos. Espera unos minutos y vuelve a intentarlo.';
+  if(/Error sending (confirmation|recovery) email/i.test(msg))return 'El servidor no pudo enviar el correo. Avisa a quien administra la plataforma.';
   if(/Failed to fetch|NetworkError|Load failed/i.test(msg))return 'No hay conexión con el servidor. Conserva tu borrador y vuelve a intentarlo.';
-  if(/JWT expired|invalid JWT/i.test(msg))return 'Inicia sesión para continuar.';
+  if(/JWT expired|invalid JWT|Auth session missing/i.test(msg))return 'Inicia sesión para continuar.';
+  if(/Could not find the function/i.test(msg))return 'La base de datos aún no tiene la versión 2 de InvestigaApp. Avisa a quien administra la plataforma.';
   return msg.replace(/^CONFLICTO:\s*/,'');
 }
 async function q(p){const {data,error}=await p;if(error)fail(clean(error.message));return data}
 async function rpc(fn,args){return q(sb.rpc(fn,args))}
-async function uid(){const {data}=await sb.auth.getSession();const id=data.session?.user?.id;if(!id)fail('Inicia sesión para continuar.');return id}
-
-function citation(s,style){
-  if(!['author','year','title','venue'].every(k=>String(s[k]??'').trim()))fail('Completa autor, año, título y revista o editorial.');
-  if(!STYLES.includes(style))fail('Estilo desconocido.');
-  const {author:a,year:y,title:t,venue:v}=s,l=s.url||'';
-  if(style==='APA')return `${a} (${y}). ${t}. ${v}. ${l}`.trim();
-  if(style==='IEEE')return `${a}, “${t},” ${v}, ${y}. ${l}`.trim();
-  return `${a}. ${t}. ${v}. ${y}. ${l}`.trim();
-}
-/* ZIP mínimo para .docx */
-const CRC=(()=>{const t=new Uint32Array(256);for(let n=0;n<256;n++){let c=n;for(let k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[n]=c>>>0}return t})();
-function crc32(b){let c=0xFFFFFFFF;for(let i=0;i<b.length;i++)c=CRC[(c^b[i])&255]^(c>>>8);return (c^0xFFFFFFFF)>>>0}
-function zip(files){const enc=new TextEncoder(),parts=[],central=[];let off=0;
-  for(const [name,content] of files){const n=enc.encode(name),d=enc.encode(content),crc=crc32(d);
-    const h=new DataView(new ArrayBuffer(30));h.setUint32(0,0x04034b50,true);h.setUint16(4,20,true);h.setUint16(6,0x0800,true);h.setUint32(14,crc,true);h.setUint32(18,d.length,true);h.setUint32(22,d.length,true);h.setUint16(26,n.length,true);parts.push(new Uint8Array(h.buffer),n,d);
-    const c=new DataView(new ArrayBuffer(46));c.setUint32(0,0x02014b50,true);c.setUint16(4,20,true);c.setUint16(6,20,true);c.setUint16(8,0x0800,true);c.setUint32(16,crc,true);c.setUint32(20,d.length,true);c.setUint32(24,d.length,true);c.setUint16(28,n.length,true);c.setUint32(42,off,true);central.push(new Uint8Array(c.buffer),n);off+=30+n.length+d.length}
-  const size=central.reduce((s,p)=>s+p.length,0),e=new DataView(new ArrayBuffer(22));e.setUint32(0,0x06054b50,true);e.setUint16(8,files.length,true);e.setUint16(10,files.length,true);e.setUint32(12,size,true);e.setUint32(16,off,true);
-  return new Blob([...parts,...central,new Uint8Array(e.buffer)])}
-const xmlEsc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g,'');
-function wordDocument(text){const body=text.split(/\r?\n/).map(l=>'<w:p><w:r><w:t xml:space="preserve">'+xmlEsc(l)+'</w:t></w:r></w:p>').join('');
-  return zip([['[Content_Types].xml','<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>'],
-  ['_rels/.rels','<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>'],
-  ['word/document.xml','<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'+body+'<w:sectPr/></w:body></w:document>']])}
-const file=(blob,name)=>new Response(blob,{headers:{'Content-Disposition':`attachment; filename="${name}"`}});
+async function session(){const {data}=await sb.auth.getSession();const s=data.session;if(!s?.user)fail('Inicia sesión para continuar.');return s.user}
+const email=v=>{const e=String(v??'').trim().toLowerCase();if(e.length>254||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e))fail('Introduce un correo válido.');return e};
+const newPassword=p=>{if(typeof p!=='string'||p.length<10)fail('La contraseña debe tener al menos 10 caracteres.');if(p.length>72)fail('La contraseña no puede superar 72 caracteres.');return p};
+const docs=()=>window.InvestigaDocs||fail('Falta documentos.js en la página.');
+let ACTIVITIES=null;
+async function activities(){if(!ACTIVITIES)ACTIVITIES=await q(sb.from('activities').select('id,title,icon,guide,example,fields').order('position'));return ACTIVITIES}
 
 async function loadProject(pid,me){
   const p=await q(sb.from('projects').select('id,owner_id,title,created_at').eq('id',pid).maybeSingle());
@@ -60,54 +52,73 @@ async function loadProject(pid,me){
     owner?q(sb.from('project_members').select('user_id,profiles(email,name)').eq('project_id',pid)):[]
   ]);
   return {project:{id:p.id,title:p.title,created:p.created_at,user_id:p.owner_id},owner,
-    versions:versions.map(v=>({...v,created:v.created_at})),
+    versions:versions.map(({created_at,...v})=>({...v,created:created_at})),
     sources:sources.map(s=>({...s,url:s.url||''})),
     readings:Object.fromEntries(readings.map(r=>[r.source_id,r.data])),
-    rewards,messages:messages.map(m=>({...m,created:m.created_at})),
-    comments:comments.map(c=>({...c,created:c.created_at,name:c.profiles?.name||'Docente'})),
+    rewards,messages:messages.map(({created_at,...m})=>({...m,created:created_at})),
+    comments:comments.map(({created_at,profiles,...c})=>({...c,created:created_at,name:profiles?.name||'Docente'})),
     members:members.map(m=>({email:m.profiles?.email||'',name:m.profiles?.name||''}))};
 }
 
 async function handle(path,data){
   const isPost=data!==undefined;data=data||{};
-  if(path==='register'||path==='login'){
-    const email=String(data.email??'').trim().toLowerCase(),password=String(data.password??'');
-    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))fail('Introduce un correo válido.');
-    if(path==='register'){
-      if(password.length<10)fail('La contraseña debe tener al menos 10 caracteres.');
-      const name=String(data.name??'').trim();if(!name||name.length>120)fail('Escribe un nombre de hasta 120 caracteres.');
-      const res=await q(sb.auth.signUp({email,password,options:{data:{name},emailRedirectTo:location.origin+location.pathname}}));
-      if(!res.session)fail('Cuenta creada. Te enviamos un correo de confirmación: ábrelo y luego ingresa con tu contraseña.');
-      if(res.user&&Array.isArray(res.user.identities)&&res.user.identities.length===0)fail('El correo ya está registrado. Ingresa con tu contraseña.');
-    }else{
-      await q(sb.auth.signInWithPassword({email,password}));
-    }
+  if(path==='register'){
+    const e=email(data.email),password=newPassword(String(data.password??'')),name=String(data.name??'').trim();
+    if(!name||name.length>120)fail('Escribe un nombre de hasta 120 caracteres.');
+    const res=await q(sb.auth.signUp({email:e,password,options:{data:{name},emailRedirectTo:here()}}));
+    if(res.user&&Array.isArray(res.user.identities)&&res.user.identities.length===0)fail('El correo ya está registrado. Ingresa con tu contraseña.');
+    if(!res.session)return {ok:true,pendingConfirmation:true};
     rpc('log_event',{p_action:'inicio_sesion'}).catch(()=>{});
     return {ok:true};
   }
-  const me=await uid();
+  if(path==='login'){
+    await q(sb.auth.signInWithPassword({email:email(data.email),password:String(data.password??'')}));
+    rpc('log_event',{p_action:'inicio_sesion'}).catch(()=>{});
+    return {ok:true};
+  }
+  if(path==='reset'){
+    /* No revela si la cuenta existe: Supabase responde igual en ambos casos. */
+    await q(sb.auth.resetPasswordForEmail(email(data.email),{redirectTo:here()}));
+    return {ok:true,emailSent:true};
+  }
+  const user=await session(),me=user.id;
+  if(path==='reset-confirm'){
+    await q(sb.auth.updateUser({password:newPassword(data.password)}));
+    api.recovery=false;
+    return {ok:true};
+  }
+  if(path==='password'){
+    const current=String(data.current??''),pw=newPassword(data.password);
+    if(pw===current)fail('La nueva contraseña debe ser distinta de la actual.');
+    const check=await sb.auth.signInWithPassword({email:user.email,password:current});
+    if(check.error)fail(/Invalid login credentials/i.test(check.error.message)?'La contraseña actual no es correcta.':clean(check.error.message));
+    await q(sb.auth.updateUser({password:pw}));
+    return {ok:true,closedSessions:0};
+  }
+  if(path==='recovery-code')fail('En la edición en la nube la contraseña se recupera por correo electrónico.');
   if(path==='logout'){await rpc('log_event',{p_action:'cierre_sesion'}).catch(()=>{});await sb.auth.signOut();return {ok:true}}
+  if(path==='teacher')return rpc('teacher_overview');
   if(path==='state'){
     const [profile,acts,contents,own,shared,questions,rfields]=await Promise.all([
       q(sb.from('profiles').select('*').eq('id',me).single()),
-      q(sb.from('activities').select('*').order('position')),
+      activities(),
       q(sb.from('contents').select('id,activity,guide,example').order('id',{ascending:false})),
       q(sb.from('projects').select('id,title,created_at').eq('owner_id',me).order('created_at')),
       q(sb.from('project_members').select('projects(id,title,created_at)').eq('user_id',me)),
       q(sb.from('diagnosis_questions').select('text,options').order('position')),
       q(sb.from('reading_fields').select('name').order('position'))
     ]);
-    const activities=acts.map(a=>{const c=contents.find(c=>c.activity===a.id);const o={id:a.id,title:a.title,icon:a.icon,guide:a.guide,example:a.example,fields:a.fields};return c?{...o,guide:c.guide,example:c.example,contentVersion:c.id}:o});
+    const list=acts.map(a=>{const c=contents.find(c=>c.activity===a.id);return c?{...a,guide:c.guide,example:c.example,contentVersion:c.id}:{...a}});
     const projects=[...own,...shared.map(s=>s.projects).filter(Boolean)].map(p=>({id:p.id,title:p.title,created:p.created_at}));
-    return {user:{id:me,name:profile.name||profile.email,email:profile.email,role:profile.role,
+    return {user:{id:me,name:profile.name||profile.email,email:profile.email,role:profile.role,hasRecovery:true,
       profile:{'Institución':profile.institution||'','Área de estudio':profile.area||'','Meta de investigación':profile.research_goal||'',reminders:profile.reminders},
-      diagnosis:profile.diagnosis},projects,activities,questions,readingFields:rfields.map(r=>r.name)};
+      diagnosis:profile.diagnosis},projects,activities:list,questions,readingFields:rfields.map(r=>r.name)};
   }
   if(path==='profile'){
     await q(sb.from('profiles').update({institution:data['Institución']||null,area:data['Área de estudio']||null,research_goal:data['Meta de investigación']||null,reminders:!!data.reminders}).eq('id',me));
     return {ok:true};
   }
-  if(path==='role')return rpc('admin_set_role',{p_email:data.email,p_role:data.role}).then(()=>({ok:true}));
+  if(path==='role'){await rpc('admin_set_role',{p_email:String(data.email??''),p_role:String(data.role??'')});return {ok:true}}
   if(path==='diagnosis')return rpc('submit_diagnosis',{p_answers:data.answers});
   if(path==='contents'){await rpc('publish_content',{p_activity:data.activity,p_guide:data.guide,p_example:data.example});return {ok:true}}
   if(path==='projects'){
@@ -118,26 +129,30 @@ async function handle(path,data){
   if(parts[0]!=='projects'||!parts[1])fail('Ruta desconocida');
   const pid=parts[1],action=parts[2]||'';
   if(!action&&!isPost)return loadProject(pid,me);
+  const src=()=>{if(!data.sourceId)fail('Selecciona una fuente del proyecto.');return data.sourceId};
+  const sourceArgs=()=>({p_author:String(data.author??''),p_year:String(data.year??''),p_title:String(data.title??''),p_venue:String(data.venue??''),p_url:String(data.url??'')||null});
   switch(action){
     case 'evidence':return rpc('save_evidence',{p_project:pid,p_activity:data.activity,p_fields:data.fields,p_base:data.baseRevision??0,p_review:!!data.review});
     case 'complete':return rpc('complete_mission',{p_project:pid,p_activity:data.activity,p_reflection:data.reflection});
-    case 'sources':return {id:await rpc('add_source',{p_project:pid,p_author:data.author,p_year:String(data.year||''),p_title:data.title,p_venue:data.venue,p_url:data.url||null})};
-    case 'reading':await rpc('save_reading',{p_source:data.sourceId,p_fields:data.fields});return {ok:true};
-    case 'mentor':return {answer:await rpc('ask_mentor',{p_project:pid,p_question:data.question})};
+    case 'sources':return {id:await rpc('add_source',{p_project:pid,...sourceArgs()})};
+    case 'source-update':await rpc('update_source',{p_source:src(),...sourceArgs()});return {ok:true};
+    case 'source-delete':await rpc('delete_source',{p_source:src()});return {ok:true};
+    case 'reading':await rpc('save_reading',{p_source:src(),p_fields:data.fields});return {ok:true};
+    case 'reading-delete':await rpc('delete_reading',{p_source:src()});return {ok:true};
+    case 'mentor':return rpc('mentor_ask',{p_project:pid,p_question:data.question,p_activity:data.activity||null});
     case 'members':await rpc('set_member',{p_project:pid,p_email:data.email,p_revoke:!!data.revoke});return {ok:true};
     case 'comments':await rpc('add_comment',{p_project:pid,p_activity:data.activity,p_revision:data.revision,p_text:data.text});return {ok:true};
+    case 'rename':await rpc('rename_project',{p_project:pid,p_title:data.title});return {ok:true};
+    case 'delete':await rpc('delete_project',{p_project:pid,p_confirm:data.confirm});return {ok:true};
     case 'export':{
       const P=await loadProject(pid,me);if(!P.owner)fail('El docente puede comentar; solo el propietario edita y exporta.');
       const fmt=data.format||'md',style=data.style||'APA';
+      if(!STYLES.includes(style))fail('Estilo desconocido.');
       const versions=[...P.versions].sort((a,b)=>a.activity.localeCompare(b.activity)||b.revision-a.revision);
       if(!versions.length)fail('Guarda al menos una evidencia antes de exportar.');
-      const prof=await q(sb.from('profiles').select('name').eq('id',me).single());
-      let text=`# ${P.project.title}\nInvestigaApp · ${prof.name}\nExportado: ${new Date().toISOString()}\nEstilo: ${style} (formato básico para artículos; verificar manualmente)\n`;
-      const seen=new Set();
-      for(const v of versions){if(seen.has(v.activity))continue;seen.add(v.activity);text+=`\n## ${v.activity} · v${v.revision} · ${v.status}\n`;for(const [k,val] of Object.entries(v.data))text+=`\n### ${k}\n${val}\n`;text+='\nRevisión: '+v.reflection+'\n'}
-      text+='\n## Referencias\n';for(const s of P.sources)text+=citation(s,style)+'\n\n';
-      text+='\n## Historial y retroalimentaciones\n';for(const v of versions)text+=`\n${v.activity} v${v.revision} · ${v.created} · ${v.status}\n`+JSON.stringify(v.feedback)+'\n';
-      text+='\n## Fichas críticas\n';for(const s of P.sources)if(P.readings[s.id])text+=s.title+'\n'+JSON.stringify(P.readings[s.id])+'\n';
+      const prof=await q(sb.from('profiles').select('name,email').eq('id',me).single());
+      const {exportMarkdown,wordDocument,file}=docs();
+      const text=exportMarkdown(await activities(),P.project.title,prof.name||prof.email,style,versions,P.sources,P.readings);
       rpc('log_event',{p_action:'exportacion',p_project:pid,p_detail:{format:fmt,style}}).catch(()=>{});
       if(fmt==='docx')return file(wordDocument(text),'portafolio.docx');
       if(fmt==='md')return file(new Blob([text],{type:'text/markdown;charset=utf-8'}),'portafolio.md');
@@ -150,7 +165,7 @@ async function handle(path,data){
 
 /* Descarga de todos mis datos (proyectos propios) */
 async function backup(){
-  const me=await uid();
+  const me=(await session()).id;
   const profile=await q(sb.from('profiles').select('email,name,role,institution,area,research_goal,diagnosis,created_at').eq('id',me).single());
   const own=await q(sb.from('projects').select('id').eq('owner_id',me));
   const projects=[];for(const p of own)projects.push(await loadProject(p.id,me));
@@ -158,5 +173,8 @@ async function backup(){
   rpc('log_event',{p_action:'respaldo'}).catch(()=>{});
   return new Blob([JSON.stringify({app:'InvestigaApp',kind:'mis-datos',exported:new Date().toISOString(),profile,diagnosisAttempts:attempts,projects},null,2)],{type:'application/json'});
 }
-window.InvestigaAPI={request:(path,data)=>handle(path,data===undefined?undefined:JSON.parse(JSON.stringify(data))).catch(e=>{throw new Error(clean(e.message))}),backup,client:sb,mode:'nube'};
+api.request=(path,data)=>handle(path,data===undefined?undefined:JSON.parse(JSON.stringify(data))).catch(e=>{throw new Error(clean(e.message))});
+api.backup=backup;
+api.mode='nube';
+window.InvestigaCloud=api;
 })();

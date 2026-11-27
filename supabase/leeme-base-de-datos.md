@@ -42,3 +42,9 @@ group by 1,2 order by 3 desc;
 -- Últimos eventos
 select created_at, entity, action, actor_id from activity_log order by id desc limit 50;
 ```
+
+## Versión 2 (26/11/2026)
+6. `06_rubrica_mentor_v2_gestion` — rúbrica y Mentor v2 en el servidor, editar y eliminar fuentes, fichas y proyectos, y panel docente.
+7. `07_datos_rubrica_mentor` — listas de la rúbrica y textos del Mentor.
+
+El código fuente y el SQL de las migraciones están en la carpeta `supabase/` del proyecto InvestigaApp.
